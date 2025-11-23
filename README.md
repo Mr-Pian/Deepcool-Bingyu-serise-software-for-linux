@@ -1,4 +1,4 @@
-7. # Deepcool 冰域系列 (Liquid Cooler) Linux Python 驱动
+# Deepcool 冰域系列 (Liquid Cooler) Linux Python 驱动
 
    
 
