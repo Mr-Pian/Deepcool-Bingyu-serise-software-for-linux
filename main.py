@@ -4,10 +4,33 @@ import time
 import struct
 import psutil
 import socket
-import datetime
 import os
+import sys
+import json
+import threading
+import argparse
+import cv2
 from collections import deque
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+
+# --- 配置 ---
+SOCKET_PATH = "/tmp/deepcool.sock"
+
+
+# --- 辅助函数：等比缩放并居中 ---
+def resize_contain(pil_img, target_width=320, target_height=240, bg_color=(0, 0, 0)):
+    width_ratio = target_width / pil_img.width
+    height_ratio = target_height / pil_img.height
+    scale = min(width_ratio, height_ratio)
+    new_width = int(pil_img.width * scale)
+    new_height = int(pil_img.height * scale)
+
+    resample_method = getattr(Image, "Resampling", Image).LANCZOS
+    img_resized = pil_img.resize((new_width, new_height), resample_method)
+
+    new_img = Image.new("RGB", (target_width, target_height), bg_color)
+    new_img.paste(img_resized, ((target_width - new_width) // 2, (target_height - new_height) // 2))
+    return new_img
 
 
 # --- 硬件监控类 ---
@@ -24,35 +47,23 @@ class SystemMonitor:
 
     def _init_power_monitoring(self):
         rapl_path = '/sys/class/powercap/intel-rapl:0/energy_uj'
-        if os.path.exists(rapl_path):
-            if os.access(rapl_path, os.R_OK):
-                self.power_path = rapl_path
-                try:
-                    self.last_rapl_energy = int(self._read_file(rapl_path))
-                    self.last_rapl_time = time.time()
-                    print(f"Power Monitor: 已加载系统电源接口 (RAPL)")
-                except:
-                    print("Power Monitor: 接口读取失败")
-            else:
-                print(f"Power Monitor: 无权限读取电源接口 (请使用 sudo)")
+        if os.path.exists(rapl_path) and os.access(rapl_path, os.R_OK):
+            self.power_path = rapl_path
+            try:
+                self.last_rapl_energy = int(self._read_file(rapl_path))
+                self.last_rapl_time = time.time()
+            except:
+                pass
 
     def _read_file(self, path):
-        with open(path, 'r') as f:
-            return f.read().strip()
+        with open(path, 'r') as f: return f.read().strip()
 
     def get_uptime_str(self):
-        """
-        获取精确到秒的运行时间
-        格式: UP: 1d 05:30:59 或 UP: 05:30:59
-        """
         diff = time.time() - self.boot_time
         m, s = divmod(diff, 60)
         h, m = divmod(m, 60)
         d, h = divmod(h, 24)
-
-        # 这里加上了 :{int(s):02} 来显示秒
-        if d > 0:
-            return f"UP: {int(d)}d {int(h):02}:{int(m):02}:{int(s):02}"
+        if d > 0: return f"UP: {int(d)}d {int(h):02}:{int(m):02}:{int(s):02}"
         return f"UP: {int(h):02}:{int(m):02}:{int(s):02}"
 
     def get_cpu_usage(self):
@@ -64,12 +75,10 @@ class SystemMonitor:
         temps = psutil.sensors_temperatures()
         if 'k10temp' in temps:
             for entry in temps['k10temp']:
-                if entry.label in ['Tctl', 'Tdie']:
-                    return entry.current
+                if entry.label in ['Tctl', 'Tdie']: return entry.current
         sensor_names = ['acpitz', 'zenpower']
         for name in sensor_names:
-            if name in temps:
-                return temps[name][0].current
+            if name in temps: return temps[name][0].current
         return 0.0
 
     def get_cpu_power(self):
@@ -80,50 +89,38 @@ class SystemMonitor:
             time_delta = current_time - self.last_rapl_time
             if time_delta < 0.05: return self.last_valid_power
             energy_delta = raw_val - self.last_rapl_energy
-            if energy_delta < 0:
-                self.last_rapl_energy = raw_val
-                self.last_rapl_time = current_time
-                return self.last_valid_power
-            if energy_delta == 0: return self.last_valid_power
+            if energy_delta < 0 or energy_delta == 0: return self.last_valid_power
             watts = (energy_delta / 1_000_000.0) / time_delta
             self.last_valid_power = watts
             self.last_rapl_energy = raw_val
             self.last_rapl_time = current_time
             return watts
-        except Exception:
+        except:
             return self.last_valid_power
 
 
-# --- 屏幕驱动类 (保持不变) ---
+# --- 屏幕驱动类 ---
 class DeepCoolScreen:
     PACKET_HEADER = bytes.fromhex("aa08000001005802002c01bc11")
-    WIDTH = 320
-    HEIGHT = 240
-    IMG_SIZE = 153600
+    WIDTH, HEIGHT, IMG_SIZE = 320, 240, 153600
 
     def __init__(self, vendor_id=0x3633, product_id=0x0026):
         self.dev = usb.core.find(idVendor=vendor_id, idProduct=product_id)
-        if not self.dev: raise ValueError("未找到设备")
+        if not self.dev: raise ValueError("Device not found")
         try:
-            if self.dev.is_kernel_driver_active(0):
-                self.dev.detach_kernel_driver(0)
+            if self.dev.is_kernel_driver_active(0): self.dev.detach_kernel_driver(0)
             self.dev.set_configuration()
         except:
             pass
-
         cfg = self.dev.get_active_configuration()
         intf = cfg[(0, 0)]
-        self.ep_out = usb.util.find_descriptor(
-            intf, custom_match=lambda e: \
-                usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
-        )
-
+        self.ep_out = usb.util.find_descriptor(intf, custom_match=lambda e: usb.util.endpoint_direction(
+            e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
         self.ep_out.write(bytes.fromhex("aa04000603640027b9"))
         time.sleep(0.01)
         self.ep_out.write(bytes.fromhex("aa0100092991"))
         time.sleep(0.01)
         self.ep_out.write(self.PACKET_HEADER)
-
         self.font_large = self._load_font(45)
         self.font_med = self._load_font(22)
         self.font_small = self._load_font(13)
@@ -139,154 +136,241 @@ class DeepCoolScreen:
         return ImageFont.load_default()
 
     def display(self, img):
-        if img.size != (self.WIDTH, self.HEIGHT):
-            img = img.resize((self.WIDTH, self.HEIGHT))
-
+        if img.size != (self.WIDTH, self.HEIGHT): img = img.resize((self.WIDTH, self.HEIGHT))
         pixels = img.getdata()
         buffer = bytearray(self.IMG_SIZE)
         idx = 0
         for r, g, b in pixels:
-            r5 = (r >> 3) & 0x1F
-            g6 = (g >> 2) & 0x3F
-            b5 = (b >> 3) & 0x1F
+            r5, g6, b5 = (r >> 3) & 0x1F, (g >> 2) & 0x3F, (b >> 3) & 0x1F
             rgb565 = (r5 << 11) | (g6 << 5) | b5
             struct.pack_into('<H', buffer, idx, rgb565)
             idx += 2
         try:
             self.ep_out.write(self.PACKET_HEADER)
             self.ep_out.write(buffer)
-        except usb.core.USBError:
+        except:
             pass
 
 
-# --- 界面绘制 ---
-def draw_ui(screen_obj, monitor):
+# --- UI 绘制 (监控模式) ---
+def draw_monitor_ui(screen_obj, monitor):
     image = Image.new("RGB", (320, 240), "#000000")
     draw = ImageDraw.Draw(image)
+    temp, usage, power = monitor.get_cpu_temp(), monitor.get_cpu_usage(), monitor.get_cpu_power()
 
-    temp = monitor.get_cpu_temp()
-    usage = monitor.get_cpu_usage()
-    power = monitor.get_cpu_power()
-    uptime_str = monitor.get_uptime_str()
+    # 颜色
+    C_BG, C_DIM, C_ACCENT = "#111111", "#777777", "#00CCFF"
+    c_temp = "#00FF00"
+    if temp > 55: c_temp = "#FFD700"
+    if temp > 75: c_temp = "#FF3300"
 
-    COLOR_BG_HEADER = "#111111"
-    COLOR_TEXT_DIM = "#777777"
-    COLOR_ACCENT = "#00CCFF"
-
-    color_temp = "#00FF00"
-    if temp > 55: color_temp = "#FFD700"
-    if temp > 75: color_temp = "#FF3300"
-
-    # === 1. 顶部信息栏 ===
-    draw.rectangle((0, 0, 320, 28), fill=COLOR_BG_HEADER)
+    # Header
+    draw.rectangle((0, 0, 320, 28), fill=C_BG)
     draw.text((8, 5), f"{monitor.hostname.upper()}'s PC", font=screen_obj.font_small, fill="#FFFFFF")
     try:
-        bbox = draw.textbbox((0, 0), uptime_str, font=screen_obj.font_small)
-        text_w = bbox[2] - bbox[0]
+        text_w = draw.textbbox((0, 0), monitor.get_uptime_str(), font=screen_obj.font_small)[2]
     except:
         text_w = 80
-    # 这里颜色我改回了白色，如果你想要之前的蓝色，可以改成 fill=COLOR_ACCENT
-    draw.text((320 - text_w - 8, 5), uptime_str, font=screen_obj.font_small, fill="#FFFFFF")
+    draw.text((320 - text_w - 8, 5), monitor.get_uptime_str(), font=screen_obj.font_small, fill="#FFFFFF")
 
-    # === 定义对齐坐标系 ===
-    LABEL_Y = 40  # 左右两边标题统一高度
-    CONTENT_Y_START = 65  # 左右两边内容统一起始高度
-    LEFT_MARGIN = 30  # 左边块起始 X
-    RIGHT_MARGIN = 160  # 右边块起始 X (屏幕中间)
+    # Layout
+    LABEL_Y, CONTENT_Y, L_MARGIN, R_MARGIN = 40, 65, 30, 160
 
-    # === 2. 左侧: CPU 温度 ===
-    # 标题
-    draw.text((LEFT_MARGIN + 17, LABEL_Y), "CPU TEMP", font=screen_obj.font_small, fill=COLOR_TEXT_DIM)
+    # Left (Temp)
+    draw.text((L_MARGIN + 17, LABEL_Y), "CPU TEMP", font=screen_obj.font_small, fill=C_DIM)
+    arc_box = (L_MARGIN - 5, CONTENT_Y, L_MARGIN + 95, CONTENT_Y + 100)
+    draw.arc(arc_box, 0, 360, "#222222", 5)
+    draw.arc(arc_box, 270, 270 + int(360 * (temp / 100)), c_temp, 5)
+    off_x = 0 if temp < 100 else -10
+    draw.text((L_MARGIN + 15 + off_x, CONTENT_Y + 18), f"{int(temp)}°", font=screen_obj.font_large, fill="#FFFFFF")
 
-    # 圆环
-    arc_box = (LEFT_MARGIN - 5, CONTENT_Y_START, LEFT_MARGIN + 95, CONTENT_Y_START + 100)
-    draw.arc(arc_box, start=0, end=360, fill="#222222", width=5)
-    start_angle = 270
-    sweep_angle = int(360 * (temp / 100))
-    end_angle = start_angle + sweep_angle
-    draw.arc(arc_box, start=start_angle, end=end_angle, fill=color_temp, width=5)
+    # Right (Load & Power)
+    draw.text((R_MARGIN, LABEL_Y), "CPU LOAD", font=screen_obj.font_small, fill=C_DIM)
+    draw.rectangle((R_MARGIN, CONTENT_Y, 300, CONTENT_Y + 12), fill="#222222")
+    draw.rectangle((R_MARGIN, CONTENT_Y, R_MARGIN + int((300 - R_MARGIN) * (usage / 100)), CONTENT_Y + 12),
+                   fill=C_ACCENT)
+    draw.text((R_MARGIN, CONTENT_Y + 15), f"{usage:.1f}%", font=screen_obj.font_med, fill="#FFFFFF")
 
-    # 数值
-    t_str = f"{int(temp)}°"
-    offset_x = 0 if temp < 100 else -10
-    draw.text((LEFT_MARGIN + 15 + offset_x, CONTENT_Y_START + 18), t_str, font=screen_obj.font_large, fill="#FFFFFF")
+    draw.text((R_MARGIN, 115), "POWER", font=screen_obj.font_small, fill=C_DIM)
+    draw.text((R_MARGIN, 135), f"{power:.1f} W", font=screen_obj.font_med, fill="#FFAA00")
 
-    # === 3. 右侧: 负载与功耗 ===
+    # Graph
+    GH, GY = 50, 240
+    draw.rectangle((0, GY - GH, 320, GY), fill="#080808")
+    for i in range(1, 4): draw.line((0, GY - GH * i // 4, 320, GY - GH * i // 4), "#2A2A2A")
+    for i in range(1, 5): draw.line((320 * i // 5, GY - GH, 320 * i // 5, GY), "#2A2A2A")
+    draw.line((0, GY - GH, 320, GY - GH), "#333333")
 
-    # --- CPU LOAD 块 ---
-    draw.text((RIGHT_MARGIN, LABEL_Y), "CPU LOAD", font=screen_obj.font_small, fill=COLOR_TEXT_DIM)
-
-    bar_height = 12
-    draw.rectangle((RIGHT_MARGIN, CONTENT_Y_START, 300, CONTENT_Y_START + bar_height), fill="#222222")
-    bar_len = int((300 - RIGHT_MARGIN) * (usage / 100))
-    draw.rectangle((RIGHT_MARGIN, CONTENT_Y_START, RIGHT_MARGIN + bar_len, CONTENT_Y_START + bar_height),
-                   fill=COLOR_ACCENT)
-
-    draw.text((RIGHT_MARGIN, CONTENT_Y_START + 15), f"{usage:.1f}%", font=screen_obj.font_med, fill="#FFFFFF")
-
-    # --- POWER 块 ---
-    POWER_Y_START = 115
-
-    draw.text((RIGHT_MARGIN, POWER_Y_START), "POWER", font=screen_obj.font_small, fill=COLOR_TEXT_DIM)
-    p_str = f"{power:.1f} W"
-    draw.text((RIGHT_MARGIN, POWER_Y_START + 20), p_str, font=screen_obj.font_med, fill="#FFAA00")
-
-    # === 4. 底部: 历史波形图 ===
-    graph_h = 50
-    graph_y_base = 240
-    graph_top_y = graph_y_base - graph_h
-
-    draw.rectangle((0, graph_top_y, 320, 240), fill="#080808")
-
-    # 网格线
-    COLOR_GRID = "#2A2A2A"
-    for i in range(1, 4):
-        y_grid = int(graph_y_base - (graph_h * i / 4))
-        draw.line((0, y_grid, 320, y_grid), fill=COLOR_GRID)
-    for i in range(1, 5):
-        x_grid = int(320 * i / 5)
-        draw.line((x_grid, graph_top_y, x_grid, graph_y_base), fill=COLOR_GRID)
-    draw.line((0, graph_top_y, 320, graph_top_y), fill="#333333")
-
-    # 曲线
     pts = []
     step = 320 / (len(monitor.usage_history) - 1)
     for i, val in enumerate(monitor.usage_history):
-        x = int(i * step)
-        y = int(graph_y_base - (val / 100 * graph_h))
-        if y >= graph_y_base: y = graph_y_base - 1
-        if y <= graph_top_y: y = graph_top_y + 1
-        pts.append((x, y))
-
-    if len(pts) > 1:
-        draw.line(pts, fill=COLOR_ACCENT, width=2)
+        y = int(GY - (val / 100 * GH))
+        pts.append((int(i * step), min(max(y, GY - GH + 1), GY - 1)))
+    if len(pts) > 1: draw.line(pts, fill=C_ACCENT, width=2)
 
     return image
 
 
-def main():
+# --- 服务端状态管理 ---
+class ServiceState:
+    def __init__(self):
+        self.mode = "MONITOR"
+        self.brightness = 1.0
+        self.video_cap = None
+        self.video_fps = 30.0
+        self.static_image = None
+
+    def _cleanup(self):
+        if self.video_cap and self.video_cap.isOpened():
+            self.video_cap.release()
+            self.video_cap = None
+        self.static_image = None
+
+    def set_media(self, path):
+        if not os.path.exists(path): return False, "File not found"
+        try:
+            self._cleanup()
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened(): return False, "Failed to open media"
+
+            ret, frame = cap.read()
+            if not ret: return False, "Empty media"
+
+            # 智能判断: 如果是单帧或无FPS信息，视为静态图以节省CPU
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(frame_rgb)
+            processed_img = resize_contain(pil_img, 320, 240)
+
+            if frame_count == 1 or fps <= 0:
+                self.mode = "STATIC"
+                self.static_image = processed_img
+                cap.release()
+                return True, "Static Image loaded"
+            else:
+                self.mode = "VIDEO"
+                self.video_cap = cap
+                self.video_fps = fps if fps > 0 else 30.0
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                return True, f"Video loaded ({self.video_fps} FPS)"
+        except Exception as e:
+            return False, str(e)
+
+
+# --- Socket Server ---
+def server_thread(state):
+    if os.path.exists(SOCKET_PATH):
+        try:
+            os.unlink(SOCKET_PATH)
+        except:
+            pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET_PATH)
+    server.listen(1)
+    os.chmod(SOCKET_PATH, 0o666)
+
+    while True:
+        try:
+            conn, _ = server.accept()
+            data = conn.recv(4096)
+            if data:
+                cmd = json.loads(data.decode())
+                act = cmd.get('action')
+                res = {"status": "ok"}
+
+                if act == 'monitor':
+                    state.mode = "MONITOR"
+                    state._cleanup()
+                elif act == 'media':
+                    success, msg = state.set_media(cmd.get('path'))
+                    if not success: res = {"status": "error", "message": msg}
+                elif act == 'brightness':
+                    state.brightness = max(0.0, min(1.0, cmd.get('value', 100) / 100.0))
+
+                conn.send(json.dumps(res).encode())
+            conn.close()
+        except:
+            pass
+
+
+# --- Client ---
+def send_cmd(payload):
+    if not os.path.exists(SOCKET_PATH):
+        print("Error: Service not running")
+        return
     try:
-        # time.sleep(5)
-        print("Dashboard Started. (Refresh: 5Hz)")
-        monitor = SystemMonitor()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(SOCKET_PATH)
+        client.send(json.dumps(payload).encode())
+        print("Server-Deepcool:", client.recv(4096).decode())
+        client.close()
+    except Exception as e:
+        print(f"Connection failed: {e}")
+
+
+# --- Main ---
+def main():
+    parser = argparse.ArgumentParser()
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--daemon", action="store_true")
+    group.add_argument("--monitor", action="store_true")
+    group.add_argument("--media", type=str, help="Play Image/Video/GIF")
+    parser.add_argument("--brightness", type=int)
+    args = parser.parse_args()
+
+    if args.monitor or args.media or (args.brightness is not None):
+        if args.monitor: send_cmd({"action": "monitor"})
+        if args.media: send_cmd({"action": "media", "path": os.path.abspath(args.media)})
+        if args.brightness is not None: send_cmd({"action": "brightness", "value": args.brightness})
+        return
+
+    print("DeepCool Service Started...")
+    state, monitor = ServiceState(), SystemMonitor()
+    try:
         screen = DeepCoolScreen()
+    except:
+        return
 
-        TARGET_INTERVAL = 0.2
+    t = threading.Thread(target=server_thread, args=(state,), daemon=True)
+    t.start()
 
+    try:
         while True:
-            loop_start = time.time()
-            img = draw_ui(screen, monitor)
-            screen.display(img)
-            elapsed = time.time() - loop_start
-            sleep_time = TARGET_INTERVAL - elapsed
-            if sleep_time > 0: time.sleep(sleep_time)
+            start = time.time()
+            img = None
 
+            if state.mode == "MONITOR":
+                img = draw_monitor_ui(screen, monitor)
+            elif state.mode == "STATIC":
+                if state.static_image: img = state.static_image.copy()
+            elif state.mode == "VIDEO":
+                if state.video_cap and state.video_cap.isOpened():
+                    ret, frame = state.video_cap.read()
+                    if not ret:
+                        state.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = state.video_cap.read()
+                    if ret:
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        img = resize_contain(Image.fromarray(rgb), 320, 240)
+
+            if img:
+                if state.brightness < 1.0:
+                    img = ImageEnhance.Brightness(img).enhance(state.brightness)
+                screen.display(img)
+
+            wait = 0
+            if state.mode == "VIDEO":
+                wait = (1.0 / state.video_fps) - (time.time() - start)
+            else:
+                wait = 0.2 - (time.time() - start)
+
+            if wait > 0: time.sleep(wait)
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        print(f"Error: {e}")
     finally:
-        pass
+        if os.path.exists(SOCKET_PATH): os.unlink(SOCKET_PATH)
 
 
 if __name__ == "__main__":
