@@ -15,7 +15,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 
 # --- 配置 ---
 SOCKET_PATH = "/tmp/deepcool.sock"
-
+# 配置文件路径 (与脚本同目录)
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 # --- 辅助函数：等比缩放并居中 ---
 def resize_contain(pil_img, target_width=320, target_height=240, bg_color=(0, 0, 0)):
@@ -32,6 +33,32 @@ def resize_contain(pil_img, target_width=320, target_height=240, bg_color=(0, 0,
     new_img.paste(img_resized, ((target_width - new_width) // 2, (target_height - new_height) // 2))
     return new_img
 
+# --- 辅助函数：OpenCV 高性能缩放 ---
+def process_frame_cv2(cv_frame, target_width=320, target_height=240, mode='contain'):
+    h, w = cv_frame.shape[:2]
+    scale = 1.0
+    if mode == 'cover':
+        scale = max(target_width / w, target_height / h)
+    else:
+        scale = min(target_width / w, target_height / h)
+
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    resized = cv2.resize(cv_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    rgb_frame = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    pil_content = Image.fromarray(rgb_frame)
+
+    if mode == 'cover':
+        left = (new_w - target_width) // 2
+        top = (new_h - target_height) // 2
+        return pil_content.crop((left, top, left + target_width, top + target_height))
+    else:
+        new_img = Image.new("RGB", (target_width, target_height), (0, 0, 0))
+        paste_x = (target_width - new_w) // 2
+        paste_y = (target_height - new_h) // 2
+        new_img.paste(pil_content, (paste_x, paste_y))
+        return new_img
 
 # --- 硬件监控类 ---
 class SystemMonitor:
@@ -52,15 +79,20 @@ class SystemMonitor:
             try:
                 self.last_rapl_energy = int(self._read_file(rapl_path))
                 self.last_rapl_time = time.time()
-            except:
-                pass
+            except: pass
 
     def _read_file(self, path):
         with open(path, 'r') as f: return f.read().strip()
 
     def get_uptime_str(self):
-        diff = time.time() - self.boot_time
-        m, s = divmod(diff, 60)
+        # 修复: 直接读取 /proc/uptime 避免时区问题
+        try:
+            with open('/proc/uptime', 'r') as f:
+                uptime_seconds = float(f.readline().split()[0])
+        except:
+            uptime_seconds = time.time() - self.boot_time
+
+        m, s = divmod(uptime_seconds, 60)
         h, m = divmod(m, 60)
         d, h = divmod(h, 24)
         if d > 0: return f"UP: {int(d)}d {int(h):02}:{int(m):02}:{int(s):02}"
@@ -95,9 +127,7 @@ class SystemMonitor:
             self.last_rapl_energy = raw_val
             self.last_rapl_time = current_time
             return watts
-        except:
-            return self.last_valid_power
-
+        except: return self.last_valid_power
 
 # --- 屏幕驱动类 ---
 class DeepCoolScreen:
@@ -110,12 +140,10 @@ class DeepCoolScreen:
         try:
             if self.dev.is_kernel_driver_active(0): self.dev.detach_kernel_driver(0)
             self.dev.set_configuration()
-        except:
-            pass
+        except: pass
         cfg = self.dev.get_active_configuration()
         intf = cfg[(0, 0)]
-        self.ep_out = usb.util.find_descriptor(intf, custom_match=lambda e: usb.util.endpoint_direction(
-            e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
+        self.ep_out = usb.util.find_descriptor(intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
         self.ep_out.write(bytes.fromhex("aa04000603640027b9"))
         time.sleep(0.01)
         self.ep_out.write(bytes.fromhex("aa0100092991"))
@@ -148,9 +176,7 @@ class DeepCoolScreen:
         try:
             self.ep_out.write(self.PACKET_HEADER)
             self.ep_out.write(buffer)
-        except:
-            pass
-
+        except: pass
 
 # --- UI 绘制 (监控模式) ---
 def draw_monitor_ui(screen_obj, monitor):
@@ -158,25 +184,19 @@ def draw_monitor_ui(screen_obj, monitor):
     draw = ImageDraw.Draw(image)
     temp, usage, power = monitor.get_cpu_temp(), monitor.get_cpu_usage(), monitor.get_cpu_power()
 
-    # 颜色
     C_BG, C_DIM, C_ACCENT = "#111111", "#777777", "#00CCFF"
     c_temp = "#00FF00"
     if temp > 55: c_temp = "#FFD700"
     if temp > 75: c_temp = "#FF3300"
 
-    # Header
     draw.rectangle((0, 0, 320, 28), fill=C_BG)
     draw.text((8, 5), f"{monitor.hostname.upper()}'s PC", font=screen_obj.font_small, fill="#FFFFFF")
-    try:
-        text_w = draw.textbbox((0, 0), monitor.get_uptime_str(), font=screen_obj.font_small)[2]
-    except:
-        text_w = 80
+    try: text_w = draw.textbbox((0, 0), monitor.get_uptime_str(), font=screen_obj.font_small)[2]
+    except: text_w = 80
     draw.text((320 - text_w - 8, 5), monitor.get_uptime_str(), font=screen_obj.font_small, fill="#FFFFFF")
 
-    # Layout
     LABEL_Y, CONTENT_Y, L_MARGIN, R_MARGIN = 40, 65, 30, 160
 
-    # Left (Temp)
     draw.text((L_MARGIN + 17, LABEL_Y), "CPU TEMP", font=screen_obj.font_small, fill=C_DIM)
     arc_box = (L_MARGIN - 5, CONTENT_Y, L_MARGIN + 95, CONTENT_Y + 100)
     draw.arc(arc_box, 0, 360, "#222222", 5)
@@ -184,22 +204,19 @@ def draw_monitor_ui(screen_obj, monitor):
     off_x = 0 if temp < 100 else -10
     draw.text((L_MARGIN + 15 + off_x, CONTENT_Y + 18), f"{int(temp)}°", font=screen_obj.font_large, fill="#FFFFFF")
 
-    # Right (Load & Power)
     draw.text((R_MARGIN, LABEL_Y), "CPU LOAD", font=screen_obj.font_small, fill=C_DIM)
     draw.rectangle((R_MARGIN, CONTENT_Y, 300, CONTENT_Y + 12), fill="#222222")
-    draw.rectangle((R_MARGIN, CONTENT_Y, R_MARGIN + int((300 - R_MARGIN) * (usage / 100)), CONTENT_Y + 12),
-                   fill=C_ACCENT)
+    draw.rectangle((R_MARGIN, CONTENT_Y, R_MARGIN + int((300-R_MARGIN)*(usage/100)), CONTENT_Y + 12), fill=C_ACCENT)
     draw.text((R_MARGIN, CONTENT_Y + 15), f"{usage:.1f}%", font=screen_obj.font_med, fill="#FFFFFF")
 
     draw.text((R_MARGIN, 115), "POWER", font=screen_obj.font_small, fill=C_DIM)
     draw.text((R_MARGIN, 135), f"{power:.1f} W", font=screen_obj.font_med, fill="#FFAA00")
 
-    # Graph
     GH, GY = 50, 240
-    draw.rectangle((0, GY - GH, 320, GY), fill="#080808")
-    for i in range(1, 4): draw.line((0, GY - GH * i // 4, 320, GY - GH * i // 4), "#2A2A2A")
-    for i in range(1, 5): draw.line((320 * i // 5, GY - GH, 320 * i // 5, GY), "#2A2A2A")
-    draw.line((0, GY - GH, 320, GY - GH), "#333333")
+    draw.rectangle((0, GY-GH, 320, GY), fill="#080808")
+    for i in range(1, 4): draw.line((0, GY - GH*i//4, 320, GY - GH*i//4), "#2A2A2A")
+    for i in range(1, 5): draw.line((320*i//5, GY-GH, 320*i//5, GY), "#2A2A2A")
+    draw.line((0, GY-GH, 320, GY-GH), "#333333")
 
     pts = []
     step = 320 / (len(monitor.usage_history) - 1)
@@ -210,8 +227,7 @@ def draw_monitor_ui(screen_obj, monitor):
 
     return image
 
-
-# --- 服务端状态管理 ---
+# --- 服务端状态管理 (带持久化配置) ---
 class ServiceState:
     def __init__(self):
         self.mode = "MONITOR"
@@ -219,12 +235,54 @@ class ServiceState:
         self.video_cap = None
         self.video_fps = 30.0
         self.static_image = None
+        self.current_media_path = None
+
+        # 初始化时加载配置
+        self.load_config()
 
     def _cleanup(self):
         if self.video_cap and self.video_cap.isOpened():
             self.video_cap.release()
             self.video_cap = None
         self.static_image = None
+
+    def load_config(self):
+        """从 JSON 加载上次的设置"""
+        if not os.path.exists(CONFIG_FILE): return
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                cfg = json.load(f)
+                self.brightness = cfg.get("brightness", 1.0)
+                last_mode = cfg.get("mode", "MONITOR")
+                last_path = cfg.get("media_path")
+
+                # 如果上次是媒体模式且文件还在，尝试恢复
+                if last_mode in ["VIDEO", "STATIC"] and last_path:
+                    success, _ = self.set_media(last_path)
+                    if not success:
+                        print(f"Restore media failed: {last_path}")
+                        self.mode = "MONITOR"
+                else:
+                    self.mode = "MONITOR"
+            print(f"Config loaded: Mode={self.mode}, Bri={self.brightness}")
+        except Exception as e:
+            print(f"Config load error: {e}")
+
+    def save_config(self):
+        """保存当前设置到 JSON"""
+        try:
+            cfg = {
+                "mode": self.mode if self.mode in ["MONITOR", "VIDEO", "STATIC"] else "MONITOR",
+                "brightness": self.brightness,
+                "media_path": self.current_media_path
+            }
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(cfg, f)
+            # 确保非 root 用户可读（以便调试）
+            try: os.chmod(CONFIG_FILE, 0o666)
+            except: pass
+        except Exception as e:
+            print(f"Config save error: {e}")
 
     def set_media(self, path):
         if not os.path.exists(path): return False, "File not found"
@@ -236,36 +294,36 @@ class ServiceState:
             ret, frame = cap.read()
             if not ret: return False, "Empty media"
 
-            # 智能判断: 如果是单帧或无FPS信息，视为静态图以节省CPU
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(frame_rgb)
-            processed_img = resize_contain(pil_img, 320, 240)
+            # 初始帧预览
+            processed_img = process_frame_cv2(frame, 320, 240, mode='contain')
 
             if frame_count == 1 or fps <= 0:
                 self.mode = "STATIC"
                 self.static_image = processed_img
                 cap.release()
-                return True, "Static Image loaded"
+                msg = "Static Image loaded"
             else:
                 self.mode = "VIDEO"
                 self.video_cap = cap
                 self.video_fps = fps if fps > 0 else 30.0
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                return True, f"Video loaded ({self.video_fps} FPS)"
-        except Exception as e:
-            return False, str(e)
+                msg = f"Video loaded ({self.video_fps} FPS)"
 
+            # 设置成功后，保存路径和配置
+            self.current_media_path = path
+            self.save_config()
+            return True, msg
+
+        except Exception as e: return False, str(e)
 
 # --- Socket Server ---
 def server_thread(state):
     if os.path.exists(SOCKET_PATH):
-        try:
-            os.unlink(SOCKET_PATH)
-        except:
-            pass
+        try: os.unlink(SOCKET_PATH)
+        except: pass
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
     server.listen(1)
@@ -283,17 +341,20 @@ def server_thread(state):
                 if act == 'monitor':
                     state.mode = "MONITOR"
                     state._cleanup()
+                    state.save_config() # 切换模式时保存
+
                 elif act == 'media':
                     success, msg = state.set_media(cmd.get('path'))
                     if not success: res = {"status": "error", "message": msg}
+                    # set_media 内部已经调用 save_config
+
                 elif act == 'brightness':
                     state.brightness = max(0.0, min(1.0, cmd.get('value', 100) / 100.0))
+                    state.save_config() # 调节亮度时保存
 
                 conn.send(json.dumps(res).encode())
             conn.close()
-        except:
-            pass
-
+        except: pass
 
 # --- Client ---
 def send_cmd(payload):
@@ -304,11 +365,9 @@ def send_cmd(payload):
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(SOCKET_PATH)
         client.send(json.dumps(payload).encode())
-        print("Server-Deepcool:", client.recv(4096).decode())
+        print("Server:", client.recv(4096).decode())
         client.close()
-    except Exception as e:
-        print(f"Connection failed: {e}")
-
+    except Exception as e: print(f"Connection failed: {e}")
 
 # --- Main ---
 def main():
@@ -320,18 +379,18 @@ def main():
     parser.add_argument("--brightness", type=int)
     args = parser.parse_args()
 
+    # Client Mode
     if args.monitor or args.media or (args.brightness is not None):
         if args.monitor: send_cmd({"action": "monitor"})
         if args.media: send_cmd({"action": "media", "path": os.path.abspath(args.media)})
         if args.brightness is not None: send_cmd({"action": "brightness", "value": args.brightness})
         return
 
+    # Server Mode
     print("DeepCool Service Started...")
     state, monitor = ServiceState(), SystemMonitor()
-    try:
-        screen = DeepCoolScreen()
-    except:
-        return
+    try: screen = DeepCoolScreen()
+    except: return
 
     t = threading.Thread(target=server_thread, args=(state,), daemon=True)
     t.start()
@@ -352,8 +411,8 @@ def main():
                         state.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         ret, frame = state.video_cap.read()
                     if ret:
-                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        img = resize_contain(Image.fromarray(rgb), 320, 240)
+                        # 默认使用 'contain' (黑边)，如需满屏裁切请改 'cover'
+                        img = process_frame_cv2(frame, 320, 240, mode='contain')
 
             if img:
                 if state.brightness < 1.0:
@@ -367,11 +426,9 @@ def main():
                 wait = 0.2 - (time.time() - start)
 
             if wait > 0: time.sleep(wait)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt: pass
     finally:
         if os.path.exists(SOCKET_PATH): os.unlink(SOCKET_PATH)
-
 
 if __name__ == "__main__":
     main()
