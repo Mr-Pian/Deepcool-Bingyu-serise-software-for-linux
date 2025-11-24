@@ -102,75 +102,69 @@ def process_frame_cv2(cv_frame, target_width=320, target_height=240, mode='conta
 
 
 # --- 硬件监控类 ---
+# ... (前面的 import 保持不变)
+
+# --- 硬件监控类 (修复版) ---
 class SystemMonitor:
     def __init__(self):
         self.hostname = socket.gethostname()
         self.usage_history = deque([0] * 60, maxlen=60)
+        self.boot_time = psutil.boot_time()
         self.power_path = None
         self.last_rapl_energy = 0
         self.last_rapl_time = 0
         self.last_valid_power = 0.0
 
-        # --- 核心修复：累计时间逻辑 ---
+        # 累计时间逻辑
         self.last_save_time = time.time()
-
-        # 1. 读取配置和当前状态
         settings = load_settings()
         saved_total = settings.get("total_seconds", 0)
         last_boot_id = settings.get("boot_id", "")
         current_boot_id = get_boot_id()
         current_uptime = get_raw_uptime()
 
-        # 2. 判断是否为新开机
         if current_boot_id == last_boot_id:
-            # 情况A: 服务重启 (同一次开机)
-            # 此时 saved_total 包含了当前的 uptime，所以要减去
-            # max(0, ...) 防止时钟微小抖动导致负数
             self.history_base = max(0, saved_total - current_uptime)
-            print(f"Service Restart detected. Base restored: {self.history_base:.2f}s")
         else:
-            # 情况B: 系统重启 (新的开机)
-            # 此时 saved_total 是上次关机前的数据，不需要减 current_uptime
-            # current_uptime 是本次开机的新增时间，会直接加在 base 上显示
             self.history_base = saved_total
-            print(f"System Reboot detected. Base loaded: {self.history_base:.2f}s")
-
-            # 立即更新 boot_id，防止服务刚启动就崩溃重启后误判
             update_settings({"boot_id": current_boot_id})
 
         self._init_power_monitoring()
         atexit.register(self.force_save_runtime)
 
     def _init_power_monitoring(self):
+        """初始化或重新寻找电源路径"""
+        self.power_path = None # 重置
         rapl_path = '/sys/class/powercap/intel-rapl:0/energy_uj'
+        # 优先尝试 Intel RAPL
         if os.path.exists(rapl_path) and os.access(rapl_path, os.R_OK):
             self.power_path = rapl_path
+        else:
+            # 备选: 尝试 AMD hwmon (例如 k10temp)
+            # 这里可以根据需要扩展搜索逻辑
+            pass
+
+        if self.power_path:
             try:
-                self.last_rapl_energy = int(self._read_file(rapl_path))
+                self.last_rapl_energy = int(self._read_file(self.power_path))
                 self.last_rapl_time = time.time()
-            except:
-                pass
+                # print(f"Power sensor linked: {self.power_path}")
+            except: pass
 
     def _read_file(self, path):
         with open(path, 'r') as f: return f.read().strip()
 
     def force_save_runtime(self):
-        """强制保存"""
         current_total = self.history_base + get_raw_uptime()
-        update_settings({
-            "total_seconds": current_total,
-            "boot_id": get_boot_id()  # 确保保存当前ID
-        })
+        update_settings({"total_seconds": current_total, "boot_id": get_boot_id()})
 
     def get_total_runtime_str(self):
-        """获取总运行时间 (每60秒保存一次)"""
         now = time.time()
         current_uptime = get_raw_uptime()
         total_seconds = self.history_base + current_uptime
 
-        # 每 60 秒保存一次
         if now - self.last_save_time > 60:
-            self.force_save_runtime()  # 复用保存逻辑
+            self.force_save_runtime()
             self.last_save_time = now
 
         hours = int(total_seconds / 3600)
@@ -200,22 +194,54 @@ class SystemMonitor:
         return 0.0
 
     def get_cpu_power(self):
-        if not self.power_path: return 0.0
+        """
+        获取 CPU 功耗 (修复死锁 Bug 版)
+        """
+        # 1. 如果路径丢失，尝试重新初始化 (自我修复)
+        if not self.power_path:
+            self._init_power_monitoring()
+            if not self.power_path: return 0.0
+
         try:
             raw_val = int(self._read_file(self.power_path))
             current_time = time.time()
             time_delta = current_time - self.last_rapl_time
-            if time_delta < 0.05: return self.last_valid_power
+
+            # 防止除以零
+            if time_delta < 0.01:
+                return self.last_valid_power
+
             energy_delta = raw_val - self.last_rapl_energy
-            if energy_delta < 0 or energy_delta == 0: return self.last_valid_power
+
+            # --- 核心修复逻辑 ---
+            if energy_delta < 0:
+                # 检测到计数器翻转 (Wrap-around) 或重置
+                # 此时虽然不能计算本次的功率，但必须更新基准值！
+                # 否则下一次循环 raw_val 依然很小，delta 依然为负，导致死锁
+                self.last_rapl_energy = raw_val
+                self.last_rapl_time = current_time
+                # 返回上一次的有效值以平滑显示
+                return self.last_valid_power
+
+            if energy_delta == 0:
+                # 传感器数值没变 (采样太快或传感器更新慢)
+                # 不更新 time 和 energy，让 diff 累积到下一次，以提高精度
+                return self.last_valid_power
+
+            # 正常计算
             watts = (energy_delta / 1_000_000.0) / time_delta
+
+            # 更新状态
             self.last_valid_power = watts
             self.last_rapl_energy = raw_val
             self.last_rapl_time = current_time
-            return watts
-        except:
-            return self.last_valid_power
 
+            return watts
+
+        except Exception:
+            # 读取失败 (可能是文件锁或权限问题)
+            # 如果连续失败，可以考虑在这里加计数器触发 _init_power_monitoring
+            return self.last_valid_power
 
 # --- 屏幕驱动类 ---
 class DeepCoolScreen:
