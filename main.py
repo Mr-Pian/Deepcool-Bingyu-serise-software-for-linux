@@ -53,7 +53,6 @@ def update_settings(updates):
 
 
 def get_boot_id():
-    """获取本次开机的唯一标识"""
     try:
         with open('/proc/sys/kernel/random/boot_id', 'r') as f:
             return f.read().strip()
@@ -62,7 +61,6 @@ def get_boot_id():
 
 
 def get_raw_uptime():
-    """获取高精度系统运行时间"""
     try:
         with open('/proc/uptime', 'r') as f:
             return float(f.readline().split()[0])
@@ -102,21 +100,16 @@ def process_frame_cv2(cv_frame, target_width=320, target_height=240, mode='conta
 
 
 # --- 硬件监控类 ---
-# ... (前面的 import 保持不变)
-
-# --- 硬件监控类 (修复版) ---
 class SystemMonitor:
     def __init__(self):
         self.hostname = socket.gethostname()
         self.usage_history = deque([0] * 60, maxlen=60)
-        self.boot_time = psutil.boot_time()
         self.power_path = None
         self.last_rapl_energy = 0
         self.last_rapl_time = 0
         self.last_valid_power = 0.0
-
-        # 累计时间逻辑
         self.last_save_time = time.time()
+
         settings = load_settings()
         saved_total = settings.get("total_seconds", 0)
         last_boot_id = settings.get("boot_id", "")
@@ -133,23 +126,15 @@ class SystemMonitor:
         atexit.register(self.force_save_runtime)
 
     def _init_power_monitoring(self):
-        """初始化或重新寻找电源路径"""
-        self.power_path = None # 重置
+        self.power_path = None
         rapl_path = '/sys/class/powercap/intel-rapl:0/energy_uj'
-        # 优先尝试 Intel RAPL
         if os.path.exists(rapl_path) and os.access(rapl_path, os.R_OK):
             self.power_path = rapl_path
-        else:
-            # 备选: 尝试 AMD hwmon (例如 k10temp)
-            # 这里可以根据需要扩展搜索逻辑
-            pass
-
-        if self.power_path:
             try:
-                self.last_rapl_energy = int(self._read_file(self.power_path))
+                self.last_rapl_energy = int(self._read_file(rapl_path))
                 self.last_rapl_time = time.time()
-                # print(f"Power sensor linked: {self.power_path}")
-            except: pass
+            except:
+                pass
 
     def _read_file(self, path):
         with open(path, 'r') as f: return f.read().strip()
@@ -162,11 +147,9 @@ class SystemMonitor:
         now = time.time()
         current_uptime = get_raw_uptime()
         total_seconds = self.history_base + current_uptime
-
         if now - self.last_save_time > 60:
             self.force_save_runtime()
             self.last_save_time = now
-
         hours = int(total_seconds / 3600)
         return f"TOT: {hours}H"
 
@@ -194,80 +177,47 @@ class SystemMonitor:
         return 0.0
 
     def get_cpu_power(self):
-        """
-        获取 CPU 功耗 (修复死锁 Bug 版)
-        """
-        # 1. 如果路径丢失，尝试重新初始化 (自我修复)
         if not self.power_path:
             self._init_power_monitoring()
             if not self.power_path: return 0.0
-
         try:
             raw_val = int(self._read_file(self.power_path))
             current_time = time.time()
             time_delta = current_time - self.last_rapl_time
-
-            # 防止除以零
-            if time_delta < 0.01:
-                return self.last_valid_power
-
+            if time_delta < 0.01: return self.last_valid_power
             energy_delta = raw_val - self.last_rapl_energy
-
-            # --- 核心修复逻辑 ---
             if energy_delta < 0:
-                # 检测到计数器翻转 (Wrap-around) 或重置
-                # 此时虽然不能计算本次的功率，但必须更新基准值！
-                # 否则下一次循环 raw_val 依然很小，delta 依然为负，导致死锁
                 self.last_rapl_energy = raw_val
                 self.last_rapl_time = current_time
-                # 返回上一次的有效值以平滑显示
                 return self.last_valid_power
-
-            if energy_delta == 0:
-                # 传感器数值没变 (采样太快或传感器更新慢)
-                # 不更新 time 和 energy，让 diff 累积到下一次，以提高精度
-                return self.last_valid_power
-
-            # 正常计算
+            if energy_delta == 0: return self.last_valid_power
             watts = (energy_delta / 1_000_000.0) / time_delta
-
-            # 更新状态
             self.last_valid_power = watts
             self.last_rapl_energy = raw_val
             self.last_rapl_time = current_time
-
             return watts
-
-        except Exception:
-            # 读取失败 (可能是文件锁或权限问题)
-            # 如果连续失败，可以考虑在这里加计数器触发 _init_power_monitoring
+        except:
             return self.last_valid_power
 
-# --- 屏幕驱动类 ---
+
+# --- 屏幕驱动类 (修复：防卡死与自动重连) ---
 class DeepCoolScreen:
     PACKET_HEADER = bytes.fromhex("aa08000001005802002c01bc11")
     WIDTH, HEIGHT, IMG_SIZE = 320, 240, 153600
 
     def __init__(self, vendor_id=0x3633, product_id=0x0026):
-        self.dev = usb.core.find(idVendor=vendor_id, idProduct=product_id)
-        if not self.dev: raise ValueError("Device not found")
-        try:
-            if self.dev.is_kernel_driver_active(0): self.dev.detach_kernel_driver(0)
-            self.dev.set_configuration()
-        except:
-            pass
-        cfg = self.dev.get_active_configuration()
-        intf = cfg[(0, 0)]
-        self.ep_out = usb.util.find_descriptor(intf, custom_match=lambda e: usb.util.endpoint_direction(
-            e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
-        self.ep_out.write(bytes.fromhex("aa04000603640027b9"))
-        time.sleep(0.01)
-        self.ep_out.write(bytes.fromhex("aa0100092991"))
-        time.sleep(0.01)
-        self.ep_out.write(self.PACKET_HEADER)
+        self.vendor_id = vendor_id
+        self.product_id = product_id
+        self.dev = None
+        self.ep_out = None
+        # 初始化字体
         self.font_large = self._load_font(45)
         self.font_med = self._load_font(22)
         self.font_small = self._load_font(13)
+
+        # 尝试首次连接
+        if not self._connect_device():
+            print("Warning: Initial connection failed, will retry in loop.")
 
     def _load_font(self, size):
         font_paths = [
@@ -279,8 +229,55 @@ class DeepCoolScreen:
             if os.path.exists(p): return ImageFont.truetype(p, size)
         return ImageFont.load_default()
 
+    def _connect_device(self):
+        """连接设备的内部方法，包含资源清理和初始化握手"""
+        try:
+            # 清理旧句柄
+            if self.dev:
+                try:
+                    usb.util.dispose_resources(self.dev)
+                except:
+                    pass
+
+            # 查找设备
+            self.dev = usb.core.find(idVendor=self.vendor_id, idProduct=self.product_id)
+            if not self.dev: return False
+
+            # 解决内核驱动冲突
+            if self.dev.is_kernel_driver_active(0):
+                self.dev.detach_kernel_driver(0)
+
+            self.dev.set_configuration()
+            cfg = self.dev.get_active_configuration()
+            intf = cfg[(0, 0)]
+            self.ep_out = usb.util.find_descriptor(intf, custom_match=lambda e: usb.util.endpoint_direction(
+                e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
+
+            # 发送握手包 (增加 Timeout 防止这里卡死)
+            self.ep_out.write(bytes.fromhex("aa04000603640027b9"), timeout=1000)
+            time.sleep(0.01)
+            self.ep_out.write(bytes.fromhex("aa0100092991"), timeout=1000)
+            time.sleep(0.01)
+            self.ep_out.write(self.PACKET_HEADER, timeout=1000)
+
+            print("DeepCool Device Connected Successfully.")
+            return True
+        except Exception as e:
+            print(f"Device connection error: {e}")
+            self.dev = None
+            self.ep_out = None
+            return False
+
     def display(self, img):
-        if img.size != (self.WIDTH, self.HEIGHT): img = img.resize((self.WIDTH, self.HEIGHT))
+        # 1. 如果未连接，尝试重连
+        if not self.ep_out:
+            if not self._connect_device():
+                return  # 重连失败，跳过本次刷新
+
+        # 2. 图像处理
+        if img.size != (self.WIDTH, self.HEIGHT):
+            img = img.resize((self.WIDTH, self.HEIGHT))
+
         pixels = img.getdata()
         buffer = bytearray(self.IMG_SIZE)
         idx = 0
@@ -289,11 +286,16 @@ class DeepCoolScreen:
             rgb565 = (r5 << 11) | (g6 << 5) | b5
             struct.pack_into('<H', buffer, idx, rgb565)
             idx += 2
+
+        # 3. 发送数据 (关键修复：增加 Timeout 和重连逻辑)
         try:
-            self.ep_out.write(self.PACKET_HEADER)
-            self.ep_out.write(buffer)
-        except:
-            pass
+            self.ep_out.write(self.PACKET_HEADER, timeout=500)  # 500ms 超时
+            self.ep_out.write(buffer, timeout=1000)  # 1s 超时
+        except usb.core.USBError as e:
+            print(f"USB Transmission Error: {e}. Attempting reconnect...")
+            self._connect_device()  # 触发重连
+        except Exception as e:
+            print(f"Unknown Error during display: {e}")
 
 
 # --- UI 绘制 ---
@@ -309,7 +311,7 @@ def draw_monitor_ui(screen_obj, monitor):
 
     draw.rectangle((0, 0, 320, 28), fill=C_BG)
 
-    # 1. Hostname (Left)
+    # Header
     host_str = f"{monitor.hostname.upper()}'s PC"
     draw.text((8, 5), host_str, font=screen_obj.font_small, fill="#FFFFFF")
     try:
@@ -317,7 +319,6 @@ def draw_monitor_ui(screen_obj, monitor):
     except:
         host_w = 80
 
-    # 2. Total Runtime (Right)
     total_str = monitor.get_total_runtime_str()
     try:
         total_w = draw.textbbox((0, 0), total_str, font=screen_obj.font_small)[2]
@@ -325,18 +326,15 @@ def draw_monitor_ui(screen_obj, monitor):
         total_w = 60
     draw.text((320 - total_w - 8, 5), total_str, font=screen_obj.font_small, fill=C_ACCENT)
 
-    # 3. Uptime (动态居中: 位于 Hostname 结束和 Total 开始之间的中心)
+    # Center Uptime
     left_end = 8 + host_w
     right_start = 320 - total_w - 8
     center_point = (left_end + right_start) // 2
-
     uptime_str = monitor.get_uptime_str()
     try:
         uptime_w = draw.textbbox((0, 0), uptime_str, font=screen_obj.font_small)[2]
     except:
         uptime_w = 80
-
-    # 绘制坐标 = 中心点 - 文字一半宽度
     draw.text((center_point - (uptime_w // 2), 5), uptime_str, font=screen_obj.font_small, fill="#FFFFFF")
 
     LABEL_Y, CONTENT_Y, L_MARGIN, R_MARGIN = 40, 65, 30, 160
@@ -506,11 +504,14 @@ def main():
         return
 
     print("DeepCool Service Started...")
+
+    # 注意：DeepCoolScreen 现在在 main 循环中按需初始化，不需要在 Loop 外强制初始化
+    # 但为了 ServiceState 能正确加载，SystemMonitor 必须先启动
     state, monitor = ServiceState(), SystemMonitor()
-    try:
-        screen = DeepCoolScreen()
-    except:
-        return
+
+    # 实例化屏幕对象 (内部包含连接重试逻辑)
+    # 就算这里失败了，也不会抛异常，而是标记 dev=None，在 display loop 中重试
+    screen = DeepCoolScreen()
 
     t = threading.Thread(target=server_thread, args=(state,), daemon=True)
     t.start()
@@ -536,6 +537,7 @@ def main():
             if img:
                 if state.brightness < 1.0:
                     img = ImageEnhance.Brightness(img).enhance(state.brightness)
+                # display 方法现在包含了重连逻辑
                 screen.display(img)
 
             wait = 0
