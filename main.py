@@ -84,7 +84,7 @@ def process_frame_cv2(cv_frame, target_width=320, target_height=240, mode='conta
         new_img.paste(pil_content, ((target_width - new_w) // 2, (target_height - new_h) // 2))
         return new_img
 
-# --- 硬件监控类 ---
+# --- 硬件监控类 (最终修复版) ---
 class SystemMonitor:
     def __init__(self):
         self.hostname = socket.gethostname()
@@ -93,10 +93,10 @@ class SystemMonitor:
         self.last_rapl_energy = 0
         self.last_rapl_time = 0
         self.last_valid_power = 0.0
+        self.stuck_counter = 0  # 新增：卡死计数器
 
-        # --- 累计时间逻辑 ---
+        # 累计时间逻辑
         self.last_save_time = time.time()
-
         settings = load_settings()
         saved_total = settings.get("total_seconds", 0)
         last_boot_id = settings.get("boot_id", "")
@@ -104,10 +104,8 @@ class SystemMonitor:
         current_uptime = get_raw_uptime()
 
         if current_boot_id == last_boot_id:
-            # 同一次开机 (服务重启): 回溯 Base
             self.history_base = max(0, saved_total - current_uptime)
         else:
-            # 新开机: 继承 Total
             self.history_base = saved_total
             update_settings({"boot_id": current_boot_id})
 
@@ -116,11 +114,29 @@ class SystemMonitor:
 
     def _init_power_monitoring(self):
         self.power_path = None
-        rapl_path = '/sys/class/powercap/intel-rapl:0/energy_uj'
-        if os.path.exists(rapl_path) and os.access(rapl_path, os.R_OK):
-            self.power_path = rapl_path
+        # 扩展传感器搜索路径，增加鲁棒性
+        candidates = [
+            '/sys/class/powercap/intel-rapl:0/energy_uj',
+            '/sys/class/hwmon/hwmon0/power1_input', # AMD / Generic
+            '/sys/class/hwmon/hwmon1/power1_input',
+            '/sys/class/hwmon/hwmon2/power1_input',
+            '/sys/class/hwmon/hwmon3/power1_input'
+        ]
+
+        for path in candidates:
+            if os.path.exists(path) and os.access(path, os.R_OK):
+                try:
+                    # 尝试预读取一次，确保文件可用
+                    with open(path, 'r') as f:
+                        _ = int(f.read().strip())
+                    self.power_path = path
+                    print(f"Power sensor linked: {path}")
+                    break
+                except: continue
+
+        if self.power_path:
             try:
-                self.last_rapl_energy = int(self._read_file(rapl_path))
+                self.last_rapl_energy = int(self._read_file(self.power_path))
                 self.last_rapl_time = time.time()
             except: pass
 
@@ -165,29 +181,62 @@ class SystemMonitor:
         return 0.0
 
     def get_cpu_power(self):
+        # 1. 路径丢失检查与自动修复
         if not self.power_path:
             self._init_power_monitoring()
             if not self.power_path: return 0.0
+
         try:
             raw_val = int(self._read_file(self.power_path))
             current_time = time.time()
             time_delta = current_time - self.last_rapl_time
+
+            # 防止除零
             if time_delta < 0.01: return self.last_valid_power
+
             energy_delta = raw_val - self.last_rapl_energy
 
-            # 修复溢出死锁
+            # --- 核心修复逻辑 ---
+
+            # 情况A: 计数器翻转 (Wrap-around)
             if energy_delta < 0:
                 self.last_rapl_energy = raw_val
                 self.last_rapl_time = current_time
                 return self.last_valid_power
-            if energy_delta == 0: return self.last_valid_power
 
+            # 情况B: 传感器数值无变化 (可能卡死)
+            if energy_delta == 0:
+                self.stuck_counter += 1
+                # 如果连续 10 次 (约2秒) 都没有变化，判定为传感器卡死
+                if self.stuck_counter > 10:
+                    # print("Sensor stuck detected, resetting...")
+                    self._init_power_monitoring() # 尝试重置句柄
+                    self.stuck_counter = 0
+                    return 0.0 # 显式归零，告知用户数据已断开，而不是假死
+
+                # 短期内维持旧值，防止闪烁
+                return self.last_valid_power
+
+            # 情况C: 正常更新
+            self.stuck_counter = 0 # 重置计数器
             watts = (energy_delta / 1_000_000.0) / time_delta
+
+            # 过滤掉不合理的 0 值 (如果之前还是好好的)
+            if watts == 0.0 and self.last_valid_power > 1.0:
+                 return self.last_valid_power
+
             self.last_valid_power = watts
             self.last_rapl_energy = raw_val
             self.last_rapl_time = current_time
             return watts
-        except: return self.last_valid_power
+
+        except Exception:
+            # 读取异常，也视为卡死的一种
+            self.stuck_counter += 1
+            if self.stuck_counter > 10:
+                self._init_power_monitoring()
+                self.stuck_counter = 0
+            return self.last_valid_power
 
 # --- 屏幕驱动类 ---
 class DeepCoolScreen:
