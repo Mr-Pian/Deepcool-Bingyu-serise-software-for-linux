@@ -19,38 +19,27 @@ SOCKET_PATH = "/tmp/deepcool.sock"
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 CONFIG_LOCK = threading.Lock()
 
-
 # --- 核心工具函数 ---
 def load_settings():
     with CONFIG_LOCK:
         if not os.path.exists(CONFIG_FILE): return {}
         try:
-            with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return {}
-
+            with open(CONFIG_FILE, 'r') as f: return json.load(f)
+        except: return {}
 
 def update_settings(updates):
     with CONFIG_LOCK:
         current_data = {}
         if os.path.exists(CONFIG_FILE):
             try:
-                with open(CONFIG_FILE, 'r') as f:
-                    current_data = json.load(f)
-            except:
-                pass
+                with open(CONFIG_FILE, 'r') as f: current_data = json.load(f)
+            except: pass
         current_data.update(updates)
         try:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(current_data, f, indent=2)
-            try:
-                os.chmod(CONFIG_FILE, 0o666)
-            except:
-                pass
-        except:
-            pass
-
+            with open(CONFIG_FILE, 'w') as f: json.dump(current_data, f, indent=2)
+            try: os.chmod(CONFIG_FILE, 0o666)
+            except: pass
+        except: pass
 
 def get_boot_id():
     try:
@@ -59,14 +48,12 @@ def get_boot_id():
     except:
         return "unknown"
 
-
 def get_raw_uptime():
     try:
         with open('/proc/uptime', 'r') as f:
             return float(f.readline().split()[0])
     except:
         return time.time() - psutil.boot_time()
-
 
 # --- 辅助函数：图像处理 ---
 def resize_contain(pil_img, target_width=320, target_height=240, bg_color=(0, 0, 0)):
@@ -80,7 +67,6 @@ def resize_contain(pil_img, target_width=320, target_height=240, bg_color=(0, 0,
     new_img = Image.new("RGB", (target_width, target_height), bg_color)
     new_img.paste(img_resized, ((target_width - new_width) // 2, (target_height - new_height) // 2))
     return new_img
-
 
 def process_frame_cv2(cv_frame, target_width=320, target_height=240, mode='contain'):
     h, w = cv_frame.shape[:2]
@@ -98,7 +84,6 @@ def process_frame_cv2(cv_frame, target_width=320, target_height=240, mode='conta
         new_img.paste(pil_content, ((target_width - new_w) // 2, (target_height - new_h) // 2))
         return new_img
 
-
 # --- 硬件监控类 ---
 class SystemMonitor:
     def __init__(self):
@@ -108,6 +93,8 @@ class SystemMonitor:
         self.last_rapl_energy = 0
         self.last_rapl_time = 0
         self.last_valid_power = 0.0
+
+        # --- 累计时间逻辑 ---
         self.last_save_time = time.time()
 
         settings = load_settings()
@@ -117,8 +104,10 @@ class SystemMonitor:
         current_uptime = get_raw_uptime()
 
         if current_boot_id == last_boot_id:
+            # 同一次开机 (服务重启): 回溯 Base
             self.history_base = max(0, saved_total - current_uptime)
         else:
+            # 新开机: 继承 Total
             self.history_base = saved_total
             update_settings({"boot_id": current_boot_id})
 
@@ -133,8 +122,7 @@ class SystemMonitor:
             try:
                 self.last_rapl_energy = int(self._read_file(rapl_path))
                 self.last_rapl_time = time.time()
-            except:
-                pass
+            except: pass
 
     def _read_file(self, path):
         with open(path, 'r') as f: return f.read().strip()
@@ -186,21 +174,22 @@ class SystemMonitor:
             time_delta = current_time - self.last_rapl_time
             if time_delta < 0.01: return self.last_valid_power
             energy_delta = raw_val - self.last_rapl_energy
+
+            # 修复溢出死锁
             if energy_delta < 0:
                 self.last_rapl_energy = raw_val
                 self.last_rapl_time = current_time
                 return self.last_valid_power
             if energy_delta == 0: return self.last_valid_power
+
             watts = (energy_delta / 1_000_000.0) / time_delta
             self.last_valid_power = watts
             self.last_rapl_energy = raw_val
             self.last_rapl_time = current_time
             return watts
-        except:
-            return self.last_valid_power
+        except: return self.last_valid_power
 
-
-# --- 屏幕驱动类 (修复：防卡死与自动重连) ---
+# --- 屏幕驱动类 ---
 class DeepCoolScreen:
     PACKET_HEADER = bytes.fromhex("aa08000001005802002c01bc11")
     WIDTH, HEIGHT, IMG_SIZE = 320, 240, 153600
@@ -210,14 +199,12 @@ class DeepCoolScreen:
         self.product_id = product_id
         self.dev = None
         self.ep_out = None
-        # 初始化字体
         self.font_large = self._load_font(45)
         self.font_med = self._load_font(22)
         self.font_small = self._load_font(13)
 
-        # 尝试首次连接
-        if not self._connect_device():
-            print("Warning: Initial connection failed, will retry in loop.")
+        # 初始连接 (不抛出致命异常，允许重试)
+        self._connect_device()
 
     def _load_font(self, size):
         font_paths = [
@@ -230,51 +217,35 @@ class DeepCoolScreen:
         return ImageFont.load_default()
 
     def _connect_device(self):
-        """连接设备的内部方法，包含资源清理和初始化握手"""
         try:
-            # 清理旧句柄
-            if self.dev:
-                try:
-                    usb.util.dispose_resources(self.dev)
-                except:
-                    pass
-
-            # 查找设备
+            if self.dev: usb.util.dispose_resources(self.dev)
             self.dev = usb.core.find(idVendor=self.vendor_id, idProduct=self.product_id)
             if not self.dev: return False
-
-            # 解决内核驱动冲突
-            if self.dev.is_kernel_driver_active(0):
-                self.dev.detach_kernel_driver(0)
-
+            if self.dev.is_kernel_driver_active(0): self.dev.detach_kernel_driver(0)
             self.dev.set_configuration()
             cfg = self.dev.get_active_configuration()
             intf = cfg[(0, 0)]
-            self.ep_out = usb.util.find_descriptor(intf, custom_match=lambda e: usb.util.endpoint_direction(
-                e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
+            self.ep_out = usb.util.find_descriptor(intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
 
-            # 发送握手包 (增加 Timeout 防止这里卡死)
+            # 握手 (带超时)
             self.ep_out.write(bytes.fromhex("aa04000603640027b9"), timeout=1000)
             time.sleep(0.01)
             self.ep_out.write(bytes.fromhex("aa0100092991"), timeout=1000)
             time.sleep(0.01)
             self.ep_out.write(self.PACKET_HEADER, timeout=1000)
-
-            print("DeepCool Device Connected Successfully.")
+            print("Device connected.")
             return True
         except Exception as e:
-            print(f"Device connection error: {e}")
+            print(f"Connect error: {e}")
             self.dev = None
             self.ep_out = None
             return False
 
     def display(self, img):
-        # 1. 如果未连接，尝试重连
+        # 自动重连逻辑
         if not self.ep_out:
-            if not self._connect_device():
-                return  # 重连失败，跳过本次刷新
+            if not self._connect_device(): return
 
-        # 2. 图像处理
         if img.size != (self.WIDTH, self.HEIGHT):
             img = img.resize((self.WIDTH, self.HEIGHT))
 
@@ -287,16 +258,13 @@ class DeepCoolScreen:
             struct.pack_into('<H', buffer, idx, rgb565)
             idx += 2
 
-        # 3. 发送数据 (关键修复：增加 Timeout 和重连逻辑)
         try:
-            self.ep_out.write(self.PACKET_HEADER, timeout=500)  # 500ms 超时
-            self.ep_out.write(buffer, timeout=1000)  # 1s 超时
-        except usb.core.USBError as e:
-            print(f"USB Transmission Error: {e}. Attempting reconnect...")
-            self._connect_device()  # 触发重连
-        except Exception as e:
-            print(f"Unknown Error during display: {e}")
-
+            self.ep_out.write(self.PACKET_HEADER, timeout=500)
+            self.ep_out.write(buffer, timeout=1000)
+        except usb.core.USBError:
+            print("USB Error, attempting reconnect...")
+            self._connect_device()
+        except Exception: pass
 
 # --- UI 绘制 ---
 def draw_monitor_ui(screen_obj, monitor):
@@ -311,34 +279,25 @@ def draw_monitor_ui(screen_obj, monitor):
 
     draw.rectangle((0, 0, 320, 28), fill=C_BG)
 
-    # Header
     host_str = f"{monitor.hostname.upper()}'s PC"
     draw.text((8, 5), host_str, font=screen_obj.font_small, fill="#FFFFFF")
-    try:
-        host_w = draw.textbbox((0, 0), host_str, font=screen_obj.font_small)[2]
-    except:
-        host_w = 80
+    try: host_w = draw.textbbox((0, 0), host_str, font=screen_obj.font_small)[2]
+    except: host_w = 80
 
     total_str = monitor.get_total_runtime_str()
-    try:
-        total_w = draw.textbbox((0, 0), total_str, font=screen_obj.font_small)[2]
-    except:
-        total_w = 60
+    try: total_w = draw.textbbox((0, 0), total_str, font=screen_obj.font_small)[2]
+    except: total_w = 60
     draw.text((320 - total_w - 8, 5), total_str, font=screen_obj.font_small, fill=C_ACCENT)
 
-    # Center Uptime
     left_end = 8 + host_w
     right_start = 320 - total_w - 8
     center_point = (left_end + right_start) // 2
     uptime_str = monitor.get_uptime_str()
-    try:
-        uptime_w = draw.textbbox((0, 0), uptime_str, font=screen_obj.font_small)[2]
-    except:
-        uptime_w = 80
+    try: uptime_w = draw.textbbox((0, 0), uptime_str, font=screen_obj.font_small)[2]
+    except: uptime_w = 80
     draw.text((center_point - (uptime_w // 2), 5), uptime_str, font=screen_obj.font_small, fill="#FFFFFF")
 
     LABEL_Y, CONTENT_Y, L_MARGIN, R_MARGIN = 40, 65, 30, 160
-
     draw.text((L_MARGIN + 17, LABEL_Y), "CPU TEMP", font=screen_obj.font_small, fill=C_DIM)
     arc_box = (L_MARGIN - 5, CONTENT_Y, L_MARGIN + 95, CONTENT_Y + 100)
     draw.arc(arc_box, 0, 360, "#222222", 5)
@@ -348,18 +307,17 @@ def draw_monitor_ui(screen_obj, monitor):
 
     draw.text((R_MARGIN, LABEL_Y), "CPU LOAD", font=screen_obj.font_small, fill=C_DIM)
     draw.rectangle((R_MARGIN, CONTENT_Y, 300, CONTENT_Y + 12), fill="#222222")
-    draw.rectangle((R_MARGIN, CONTENT_Y, R_MARGIN + int((300 - R_MARGIN) * (usage / 100)), CONTENT_Y + 12),
-                   fill=C_ACCENT)
+    draw.rectangle((R_MARGIN, CONTENT_Y, R_MARGIN + int((300-R_MARGIN)*(usage/100)), CONTENT_Y + 12), fill=C_ACCENT)
     draw.text((R_MARGIN, CONTENT_Y + 15), f"{usage:.1f}%", font=screen_obj.font_med, fill="#FFFFFF")
 
     draw.text((R_MARGIN, 115), "POWER", font=screen_obj.font_small, fill=C_DIM)
     draw.text((R_MARGIN, 135), f"{power:.1f} W", font=screen_obj.font_med, fill="#FFAA00")
 
     GH, GY = 50, 240
-    draw.rectangle((0, GY - GH, 320, GY), fill="#080808")
-    for i in range(1, 4): draw.line((0, GY - GH * i // 4, 320, GY - GH * i // 4), "#2A2A2A")
-    for i in range(1, 5): draw.line((320 * i // 5, GY - GH, 320 * i // 5, GY), "#2A2A2A")
-    draw.line((0, GY - GH, 320, GY - GH), "#333333")
+    draw.rectangle((0, GY-GH, 320, GY), fill="#080808")
+    for i in range(1, 4): draw.line((0, GY - GH*i//4, 320, GY - GH*i//4), "#2A2A2A")
+    for i in range(1, 5): draw.line((320*i//5, GY-GH, 320*i//5, GY), "#2A2A2A")
+    draw.line((0, GY-GH, 320, GY-GH), "#333333")
 
     pts = []
     step = 320 / (len(monitor.usage_history) - 1)
@@ -367,9 +325,7 @@ def draw_monitor_ui(screen_obj, monitor):
         y = int(GY - (val / 100 * GH))
         pts.append((int(i * step), min(max(y, GY - GH + 1), GY - 1)))
     if len(pts) > 1: draw.line(pts, fill=C_ACCENT, width=2)
-
     return image
-
 
 # --- 服务端状态管理 ---
 class ServiceState:
@@ -396,8 +352,7 @@ class ServiceState:
         if last_mode in ["VIDEO", "STATIC"] and last_path:
             success, _ = self.set_media(last_path)
             if not success: self.mode = "MONITOR"
-        else:
-            self.mode = "MONITOR"
+        else: self.mode = "MONITOR"
 
     def set_media(self, path):
         if not os.path.exists(path): return False, "File not found"
@@ -405,15 +360,11 @@ class ServiceState:
             self._cleanup()
             cap = cv2.VideoCapture(path)
             if not cap.isOpened(): return False, "Failed to open media"
-
             ret, frame = cap.read()
             if not ret: return False, "Empty media"
-
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-
             processed_img = process_frame_cv2(frame, 320, 240, mode='contain')
-
             if frame_count == 1 or fps <= 0:
                 self.mode = "STATIC"
                 self.static_image = processed_img
@@ -425,26 +376,20 @@ class ServiceState:
                 self.video_fps = fps if fps > 0 else 30.0
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 msg = f"Video loaded ({self.video_fps} FPS)"
-
             self.current_media_path = path
             update_settings({"mode": self.mode, "media_path": path})
             return True, msg
-        except Exception as e:
-            return False, str(e)
-
+        except Exception as e: return False, str(e)
 
 # --- Socket Server ---
 def server_thread(state):
     if os.path.exists(SOCKET_PATH):
-        try:
-            os.unlink(SOCKET_PATH)
-        except:
-            pass
+        try: os.unlink(SOCKET_PATH)
+        except: pass
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
     server.listen(1)
     os.chmod(SOCKET_PATH, 0o666)
-
     while True:
         try:
             conn, _ = server.accept()
@@ -453,7 +398,6 @@ def server_thread(state):
                 cmd = json.loads(data.decode())
                 act = cmd.get('action')
                 res = {"status": "ok"}
-
                 if act == 'monitor':
                     state.mode = "MONITOR"
                     state._cleanup()
@@ -465,12 +409,9 @@ def server_thread(state):
                     val = max(0.0, min(1.0, cmd.get('value', 100) / 100.0))
                     state.brightness = val
                     update_settings({"brightness": val})
-
                 conn.send(json.dumps(res).encode())
             conn.close()
-        except:
-            pass
-
+        except: pass
 
 # --- Client ---
 def send_cmd(payload):
@@ -483,12 +424,15 @@ def send_cmd(payload):
         client.send(json.dumps(payload).encode())
         print("Server:", client.recv(4096).decode())
         client.close()
-    except Exception as e:
-        print(f"Connection failed: {e}")
-
+    except Exception as e: print(f"Connection failed: {e}")
 
 # --- Main ---
 def main():
+    # 1. 启动延时：防止系统未就绪导致崩溃
+    # 只有在作为服务运行（无参数）时才需要延时，客户端指令不需要
+    if len(sys.argv) > 1 and sys.argv[1] == '--daemon':
+        time.sleep(10)
+
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--daemon", action="store_true")
@@ -504,14 +448,9 @@ def main():
         return
 
     print("DeepCool Service Started...")
-
-    # 注意：DeepCoolScreen 现在在 main 循环中按需初始化，不需要在 Loop 外强制初始化
-    # 但为了 ServiceState 能正确加载，SystemMonitor 必须先启动
+    # 移除 try...except，让错误暴露给 Systemd
     state, monitor = ServiceState(), SystemMonitor()
-
-    # 实例化屏幕对象 (内部包含连接重试逻辑)
-    # 就算这里失败了，也不会抛异常，而是标记 dev=None，在 display loop 中重试
-    screen = DeepCoolScreen()
+    screen = DeepCoolScreen() # 内部已包含重试逻辑
 
     t = threading.Thread(target=server_thread, args=(state,), daemon=True)
     t.start()
@@ -537,7 +476,6 @@ def main():
             if img:
                 if state.brightness < 1.0:
                     img = ImageEnhance.Brightness(img).enhance(state.brightness)
-                # display 方法现在包含了重连逻辑
                 screen.display(img)
 
             wait = 0
@@ -547,11 +485,9 @@ def main():
                 wait = 0.2 - (time.time() - start)
 
             if wait > 0: time.sleep(wait)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt: pass
     finally:
         if os.path.exists(SOCKET_PATH): os.unlink(SOCKET_PATH)
-
 
 if __name__ == "__main__":
     main()
